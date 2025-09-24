@@ -1,0 +1,187 @@
+Based on my analysis of the KEDA source code and Azure SDK implementation, here's how KEDA
+  performs identity delegation without storing any credentials:
+
+  The Core Principle: JWT Assertion-Based Delegation
+
+  KEDA uses OAuth 2.0 Client Assertion Flow with JWT Bearer tokens to delegate identity. This is
+  a cryptographically secure method that doesn't require storing secrets.
+
+  ---
+  1. The Single Source of Truth: Kubernetes Service Account Token
+
+  File Location: /var/run/secrets/azure/tokens/azure-identity-token
+
+  This token is:
+  - Dynamically Generated: Kubernetes creates it fresh for KEDA pods
+  - Time-Limited: Automatically rotated by Kubernetes (every ~12 minutes)
+  - Cryptographically Signed: By Kubernetes API server with keys Azure AD trusts
+  - Pod-Scoped: Only available to KEDA operator pods
+
+  // /Users/shankar/Projects/keda/vendor/github.com/Azure/azure-sdk-for-go/sdk/azidentity/workloa
+  d_identity.go:127
+  func (w *WorkloadIdentityCredential) getAssertion(context.Context) (string, error) {
+      content, err := os.ReadFile(w.file) // Reads fresh token from filesystem
+      w.assertion = string(content)
+      w.expires = now.Add(10 * time.Minute) // Cache for safety, but re-read periodically
+      return w.assertion, nil
+  }
+
+  ---
+  2. Dynamic Identity Context Switching
+
+  The Delegation Magic: KEDA can impersonate different Azure identities by changing parameters in
+   the token exchange request:
+
+  // /Users/shankar/Projects/keda/pkg/scalers/azure/azure_aad_workload_identity.go:60
+  func GetAzureADWorkloadIdentityToken(ctx context.Context, identityID, identityTenantID, 
+  identityAuthorityHost, resource string) (AADToken, error) {
+      // Start with KEDA's default identity
+      clientID := DefaultClientID      // From KEDA's environment
+      tenantID := DefaultTenantID      // From KEDA's environment
+
+      // Switch to TriggerAuthentication identity if specified
+      if identityID != "" {
+          clientID = identityID        // Override to target identity
+      }
+      if identityTenantID != "" {
+          tenantID = identityTenantID  // Override to target tenant
+      }
+
+      // But ALWAYS use KEDA's own Kubernetes token as proof of identity
+      signedAssertion, err := readJWTFromFileSystem(TokenFilePath)
+
+  3. The Assertion Callback Pattern
+
+  KEDA uses a callback-based credential system where the same Kubernetes token is reused for
+  different identity contexts:
+
+  // /Users/shankar/Projects/keda/pkg/scalers/azure/azure_aad_workload_identity.go:87
+  cred := confidential.NewCredFromAssertionCallback(func(context.Context, 
+  confidential.AssertionRequestOptions) (string, error) {
+      return signedAssertion, nil  // Always returns KEDA's K8s token
+  })
+
+  confidentialClient, err := confidential.New(
+      fmt.Sprintf("%s%s", authorityHost, tenantID),  // Target tenant
+      clientID,                                      // Target client ID
+      cred,                                         // But uses KEDA's token as proof
+  )
+
+  4. The Trust Chain Architecture
+
+  Here's the complete delegation flow:
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │                    KEDA Identity Delegation Flow                    │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  [1] TriggerAuthentication (ws namespace)
+      ├── identityID: "managed-identity-client-id-for-devops"
+      ├── tenantID: "target-tenant-id"
+      └── resource: "499b84ac-1321-427f-aa17-267ca6975798/.default"
+
+  [2] KEDA Process (keda namespace)
+      ├── Kubernetes Token: /var/run/secrets/azure/tokens/azure-identity-token
+      ├── Default ClientID: "keda-managed-identity-client-id"
+      └── Default TenantID: "keda-tenant-id"
+
+  [3] Token Exchange Request to Azure AD
+      ┌─────────────────────────────────────────────────────────────┐
+      │ POST https://login.microsoftonline.com/{tenantID}/oauth2/v2.0/token
+      │
+      │ Headers:
+      │   Content-Type: application/x-www-form-urlencoded
+      │
+      │ Body:
+      │   grant_type=client_credentials
+      │   client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+      │   client_assertion={KEDA's Kubernetes JWT Token}  ← Same token always
+      │   client_id={Target Identity Client ID}           ← Changes per ScaledObject
+      │   scope={Target Resource}                         ← Changes per scaler type
+      └─────────────────────────────────────────────────────────────┘
+
+  [4] Azure AD Validation
+      ├── Verifies Kubernetes JWT signature (OIDC trust relationship)
+      ├── Validates client_id is federated to the Kubernetes service account
+      ├── Checks target resource permissions for the client_id
+      └── Issues resource-scoped access token
+
+  [5] Resource Access Token
+      ├── Audience: "499b84ac-1321-427f-aa17-267ca6975798" (Azure DevOps)
+      ├── Subject: Target managed identity
+      ├── Scopes: Limited to requested resource
+      └── Expires: ~1 hour (managed by Azure AD)
+
+  5. Security Model: Why This Works Without Storing Credentials
+
+  A. Cryptographic Trust Chains
+
+  1. Kubernetes → KEDA: Service account token is cryptographically signed by K8s API server
+  2. KEDA → Azure AD: OIDC federation establishes trust between K8s and Azure AD
+  3. Azure AD → Target Service: Resource-scoped tokens with limited permissions
+
+  B. No Persistent Secrets
+
+  # What KEDA DOES NOT store:
+  ✗ Azure client secrets
+  ✗ Certificate private keys
+  ✗ Service principal passwords
+  ✗ Access tokens (beyond short-term caching)
+  ✗ Refresh tokens
+
+  # What KEDA DOES have access to:
+  ✓ Dynamic Kubernetes service account tokens (auto-rotated)
+  ✓ Environment variables for identity configuration
+  ✓ Temporary access tokens (cached < 1 hour)
+
+  C. Identity Boundary Enforcement
+
+  - Federation Setup Required: Each target identity must be explicitly federated with KEDA's
+  service account
+  - Resource Scoping: Each token is limited to specific Azure resources
+  - Tenant Isolation: Tokens can't cross tenant boundaries without explicit trust
+  - Time Limitations: All tokens expire and require re-authentication
+
+  6. Example Multi-Identity Scenario
+
+  # ScaledObject 1 - DevOps Scaler
+  apiVersion: keda.sh/v1alpha1
+  kind: TriggerAuthentication
+  metadata:
+    name: devops-auth
+    namespace: team-a
+  spec:
+    podIdentity:
+      provider: azure-workload
+      identityId: "devops-managed-identity-client-id"  # Identity A
+
+  ---
+  # ScaledObject 2 - Storage Scaler  
+  apiVersion: keda.sh/v1alpha1
+  kind: TriggerAuthentication
+  metadata:
+    name: storage-auth
+    namespace: team-b
+  spec:
+    podIdentity:
+      provider: azure-workload
+      identityId: "storage-managed-identity-client-id" # Identity B
+
+  KEDA's delegation process:
+  1. Same JWT Token: Uses identical Kubernetes token for both scalers
+  2. Different Client IDs: Requests tokens for different managed identities
+  3. Different Resources: Gets scoped tokens for DevOps vs Storage APIs
+  4. Isolated Permissions: Each token can only access its designated resources
+
+  7. The Brilliant Design Benefits
+
+  1. Zero Credential Management: No secrets to rotate, backup, or secure
+  2. Dynamic Trust: Identities can be added/removed via federation without touching KEDA
+  3. Audit Trail: All authentications go through Azure AD with full logging
+  4. Principle of Least Privilege: Each token is scoped to minimum required permissions
+  5. Multi-Tenant Support: Single KEDA instance can serve multiple teams/identities
+  6. Kubernetes-Native: Leverages existing K8s security primitives
+
+  This approach transforms KEDA into a zero-trust identity broker that can securely impersonate
+  any federated identity without ever storing long-term credentials, making it both highly secure
+   and operationally simple.
