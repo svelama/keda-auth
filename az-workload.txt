@@ -1,0 +1,99 @@
+
+  Complete Authentication Flow
+
+  1. Setup & Components
+
+  - KEDA Operator: Deployed in keda namespace
+  - ScaledObject: Deployed in ws namespace
+  - TriggerAuthentication: Deployed in ws namespace with workload identity configuration
+  - Azure Workload Identity Webhook: Injects environment variables into KEDA operator pods
+
+  2. Environment Variables Injection
+
+  The Azure Workload Identity Webhook injects these environment variables into KEDA operator
+  pods:
+  AZURE_CLIENT_ID=<client-id>           # From service account annotation
+  AZURE_TENANT_ID=<tenant-id>           # From service account annotation  
+  AZURE_FEDERATED_TOKEN_FILE=/var/run/secrets/azure/tokens/azure-identity-token
+  AZURE_AUTHORITY_HOST=https://login.microsoftonline.com/
+
+  3. Cross-Namespace Authentication Resolution
+
+  When KEDA processes a ScaledObject in ws namespace:
+
+  1. Trigger Resolution (/Users/shankar/Projects/keda/pkg/scaling/scalers_builder.go:75):
+  authParams, podIdentity, err := resolver.ResolveAuthRefAndPodIdentity(ctx, h.client, logger,
+      trigger.AuthenticationRef, podTemplateSpec, withTriggers.Namespace, h.authClientSet)
+  2. TriggerAuthentication Lookup
+  (/Users/shankar/Projects/keda/pkg/scaling/resolver/scale_resolvers.go:369):
+  err := client.Get(ctx, types.NamespacedName{Name: triggerAuthRef.Name, Namespace: namespace},
+  triggerAuth)
+    - Fetches TriggerAuthentication from the ws namespace
+    - Extracts PodIdentity configuration with Provider: AzureWorkload
+  3. Authentication Method Selection
+  (/Users/shankar/Projects/keda/pkg/scalers/azure_pipelines_scaler.go:200):
+  case kedav1alpha1.PodIdentityProviderAzureWorkload:
+      cred, err := azure.NewChainedCredential(logger, config.PodIdentity)
+
+  4. Credential Chain Creation
+
+  In /Users/shankar/Projects/keda/pkg/scalers/azure/azure_azidentity_chain.go:14:
+
+  1. Chain Setup:
+  func NewChainedCredential(logger logr.Logger, podIdentity v1alpha1.AuthPodIdentity) 
+  (*azidentity.ChainedTokenCredential, error) {
+      var creds []azcore.TokenCredential
+  2. Workload Identity Credential:
+  case v1alpha1.PodIdentityProviderAzureWorkload:
+      wiCred, err := NewADWorkloadIdentityCredential(podIdentity.GetIdentityID(),
+  podIdentity.GetIdentityTenantID())
+  3. Azure SDK Integration
+  (/Users/shankar/Projects/keda/pkg/scalers/azure/azure_aad_workload_identity.go:157):
+  func NewADWorkloadIdentityCredential(identityID, identityTenantID string) 
+  (*azidentity.WorkloadIdentityCredential, error) {
+      options := &azidentity.WorkloadIdentityCredentialOptions{}
+      if identityID != "" {
+          options.ClientID = identityID
+      }
+      if identityTenantID != "" {
+          options.TenantID = identityTenantID
+      }
+      return azidentity.NewWorkloadIdentityCredential(options)
+  }
+
+  5. Token Acquisition Flow
+
+  When the scaler needs to authenticate to Azure DevOps:
+
+  1. Token Request (/Users/shankar/Projects/keda/pkg/scalers/azure_pipelines_scaler.go:314):
+  token, err := metadata.authContext.cred.GetToken(ctx, policy.TokenRequestOptions{
+      Scopes: []string{devopsResource}, // "499b84ac-1321-427f-aa17-267ca6975798/.default"
+  })
+  2. OIDC Token Exchange:
+    - Reads JWT token from /var/run/secrets/azure/tokens/azure-identity-token
+    - Exchanges it with Azure AD using client credentials flow
+    - Gets Azure AD access token for Azure DevOps resource
+  3. API Authentication (/Users/shankar/Projects/keda/pkg/scalers/azure_pipelines_scaler.go:343):
+  case kedav1alpha1.PodIdentityProviderAzureWorkload:
+      aadToken, err := getToken(ctx, metadata, devopsResource)
+      req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", aadToken))
+
+  6. Azure DevOps API Access
+
+  The authenticated request queries Azure DevOps REST API:
+  GET https://dev.azure.com/{organization}/_apis/distributedtask/pools/{poolId}/jobrequests
+  Authorization: Bearer <azure_ad_token>
+
+  Key Cross-Namespace Features:
+
+  1. Authentication Isolation: TriggerAuthentication in ws namespace is isolated from KEDA's
+  namespace
+  2. Identity Federation: KEDA operator uses its own workload identity to get tokens for scalers
+  3. Token Caching (/Users/shankar/Projects/keda/pkg/scalers/azure_pipelines_scaler.go:308):
+  Tokens are cached and reused until near expiry
+  4. Secure Token Storage: Federated tokens are mounted as projected volumes, not stored as
+  secrets
+
+  This architecture allows KEDA to scale workloads across namespaces while maintaining secure,
+  federated authentication to Azure services without requiring credential storage or
+  cross-namespace secret access.
